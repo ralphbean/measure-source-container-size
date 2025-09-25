@@ -1,0 +1,28 @@
+Original artifact: quay.io/redhat-user-workloads/rhtap-integration-tenant/yq-container/yq:yq-on-push-999gm-build-image-index
+Source containers found: 1
+Total source size: 1000.55 MB
+
+Base/Builder images found: 8
+Total base/builder source size: 2.84 GB
+Net source size (after subtracting base/builder): 159.39 MB
+
+Base/Builder images:
+  - base (DESCENDANT_OF): registry.access.redhat.com/ubi9/ubi@sha256:dbc1e98d14a022542e45b5f22e0206d3f86b5bdf237b58ee7170c9ddd1b3a283
+    Source size: 726.76 MB
+  - builder (BUILD_TOOL_OF): quay.io/konflux-ci/git-clone@sha256:4e53ebd9242f05ca55bfc8d58b3363d8b9d9bc3ab439d9ab76cdbdf5b1fd42d9
+    Source size: 0.00 B (no source containers)
+  - base (DESCENDANT_OF): registry.access.redhat.com/ubi9/ubi@sha256:dbc1e98d14a022542e45b5f22e0206d3f86b5bdf237b58ee7170c9ddd1b3a283
+    Source size: 726.76 MB
+  - builder (BUILD_TOOL_OF): quay.io/konflux-ci/git-clone@sha256:4e53ebd9242f05ca55bfc8d58b3363d8b9d9bc3ab439d9ab76cdbdf5b1fd42d9
+    Source size: 0.00 B (no source containers)
+  - base (DESCENDANT_OF): registry.access.redhat.com/ubi9/ubi@sha256:dbc1e98d14a022542e45b5f22e0206d3f86b5bdf237b58ee7170c9ddd1b3a283
+    Source size: 726.76 MB
+  - builder (BUILD_TOOL_OF): quay.io/konflux-ci/git-clone@sha256:4e53ebd9242f05ca55bfc8d58b3363d8b9d9bc3ab439d9ab76cdbdf5b1fd42d9
+    Source size: 0.00 B (no source containers)
+  - base (DESCENDANT_OF): registry.access.redhat.com/ubi9/ubi@sha256:dbc1e98d14a022542e45b5f22e0206d3f86b5bdf237b58ee7170c9ddd1b3a283
+    Source size: 726.76 MB
+  - builder (BUILD_TOOL_OF): quay.io/konflux-ci/git-clone@sha256:4e53ebd9242f05ca55bfc8d58b3363d8b9d9bc3ab439d9ab76cdbdf5b1fd42d9
+    Source size: 0.00 B (no source containers)
+
+Source containers:
+  - quay.io/redhat-user-workloads/rhtap-integration-tenant/yq-container/yq:sha256-24c87766e0bd03b288e69034d629d3fbdda50cef95a661caae553cb20adf04f8.src: 1000.55 MB

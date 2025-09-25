@@ -784,6 +784,72 @@ class SourceContainerMeasurer:
 
         return blobs
 
+    def is_source_container(self, manifest: Dict, container_url: str, source_tag: str = None) -> bool:
+        """
+        Validate if a manifest represents a source container vs a runtime container.
+        Source containers typically have many layers and contain source code artifacts.
+
+        Args:
+            manifest: The manifest to validate
+            container_url: The URL used to fetch the manifest (may be a digest)
+            source_tag: The original source tag used (e.g., 'latest-source' or 'sha256-abc.src')
+        """
+        if not manifest:
+            return False
+
+        # Get basic manifest info
+        media_type = manifest.get('mediaType', '')
+        layers = manifest.get('layers', [])
+        layer_count = len(layers)
+        total_size = sum(layer.get('size', 0) for layer in layers)
+
+        # Source container indicators:
+        # 1. URL or source_tag contains '-source' or '.src'
+        url_indicators = ['-source', '.src']
+        has_source_url = any(indicator in container_url for indicator in url_indicators)
+        has_source_tag = source_tag and any(indicator in source_tag for indicator in url_indicators)
+        has_source_indicators = has_source_url or has_source_tag
+
+        # 2. Check for runtime image characteristics (to reject them)
+        # Runtime images typically have few layers (usually 2-5) and modest sizes
+        is_likely_runtime = layer_count <= 5 and total_size < 500 * 1024 * 1024  # < 500MB
+
+        # 3. Reasonable size range (not empty, but source containers can be any size)
+        has_reasonable_size = total_size > 1024  # > 1KB (not completely empty)
+
+        # 4. Check for typical source container layer patterns
+        has_source_patterns = False
+        if layers and layer_count >= 5:
+            # Look for many small-to-medium layers (typical of source builds)
+            small_layers = [l for l in layers if l.get('size', 0) < 50 * 1024 * 1024]  # < 50MB
+            has_source_patterns = len(small_layers) >= max(3, layer_count * 0.4)
+
+        # Log validation details
+        self.log(f"Source container validation for {container_url}:")
+        self.log(f"  - URL indicators: {has_source_url} ({url_indicators})")
+        if source_tag:
+            self.log(f"  - Source tag indicators: {has_source_tag} (tag: {source_tag})")
+        self.log(f"  - Combined indicators: {has_source_indicators}")
+        self.log(f"  - Layer count: {layer_count}")
+        self.log(f"  - Size: {total_size:,} bytes (reasonable: {has_reasonable_size})")
+        self.log(f"  - Runtime-like: {is_likely_runtime}")
+        self.log(f"  - Source patterns: {has_source_patterns}")
+
+        # Consider it a source container if:
+        # 1. Has source indicators (most important) - trust the naming convention
+        # 2. Has reasonable size (not completely empty)
+        # 3. If no source indicators, then apply stricter validation to avoid runtime images
+        if has_source_indicators:
+            # If it has source indicators in the URL or tag, trust it (with basic sanity check)
+            is_source = has_reasonable_size
+        else:
+            # Without source indicators, apply stricter validation
+            is_source = (has_reasonable_size and not is_likely_runtime and
+                        (has_source_patterns or total_size > 100 * 1024 * 1024))
+
+        self.log(f"  - CONCLUSION: {'SOURCE CONTAINER' if is_source else 'NOT A SOURCE CONTAINER'}")
+        return is_source
+
     def deduplicate_child_blobs(self, child_containers: List[Dict[str, any]], parent_containers: List[Dict[str, any]]) -> Tuple[int, List[Dict[str, any]]]:
         """
         Compare blobs between child and parent containers and return only unique child blobs.
@@ -900,6 +966,34 @@ class SourceContainerMeasurer:
             self.log(f"Could not find manifest for {registry}/{repository}:{tag}")
             return source_containers
 
+        # Check if this is a digest-based lookup for a base image
+        is_digest_lookup = tag.startswith('sha256:')
+        if is_digest_lookup:
+            self.log(f"Detected digest-based lookup for base image: {registry}/{repository}@{tag}")
+            # Try common source container tags for base images
+            common_source_tags = ['latest-source', 'stable-source']
+            for common_tag in common_source_tags:
+                self.log(f"Trying common source tag: {common_tag}")
+                common_source_manifest = self.get_manifest(registry, repository, common_tag)
+                if common_source_manifest:
+                    container_url = f"{registry}/{repository}:{common_tag}"
+                    if self.is_source_container(common_source_manifest, container_url, common_tag):
+                        size = self.calculate_manifest_size(common_source_manifest)
+                        blobs = self.extract_manifest_blobs(common_source_manifest)
+                        source_containers.append({
+                            'url': container_url,
+                            'size': size,
+                            'blobs': blobs,
+                            'manifest': common_source_manifest
+                        })
+                        self.log(f"Found common tag source container: {container_url} ({size} bytes, {len(blobs)} blobs)")
+                    else:
+                        self.log(f"Skipping {container_url} - not a valid source container")
+
+            # If we found source containers using common tags, return them
+            if source_containers:
+                return source_containers
+
         if original_manifest.get('mediaType') == 'application/vnd.docker.distribution.manifest.list.v2+json' or \
            original_manifest.get('mediaType') == 'application/vnd.oci.image.index.v1+json':
             self.log("Processing image index/manifest list")
@@ -908,15 +1002,19 @@ class SourceContainerMeasurer:
             unified_source_tag = self.get_source_container_tag(tag)
             unified_source_manifest = self.get_manifest(registry, repository, unified_source_tag)
             if unified_source_manifest:
-                size = self.calculate_manifest_size(unified_source_manifest)
-                blobs = self.extract_manifest_blobs(unified_source_manifest)
-                source_containers.append({
-                    'url': f"{registry}/{repository}:{unified_source_tag}",
-                    'size': size,
-                    'blobs': blobs,
-                    'manifest': unified_source_manifest
-                })
-                self.log(f"Found unified source container: {registry}/{repository}:{unified_source_tag} ({size} bytes, {len(blobs)} blobs)")
+                container_url = f"{registry}/{repository}:{unified_source_tag}"
+                if self.is_source_container(unified_source_manifest, container_url, unified_source_tag):
+                    size = self.calculate_manifest_size(unified_source_manifest)
+                    blobs = self.extract_manifest_blobs(unified_source_manifest)
+                    source_containers.append({
+                        'url': container_url,
+                        'size': size,
+                        'blobs': blobs,
+                        'manifest': unified_source_manifest
+                    })
+                    self.log(f"Found unified source container: {container_url} ({size} bytes, {len(blobs)} blobs)")
+                else:
+                    self.log(f"Skipping {container_url} - not a valid source container")
             else:
                 # Try digest-based method as fallback
                 original_digest = self.get_manifest_digest(registry, repository, tag)
@@ -924,64 +1022,77 @@ class SourceContainerMeasurer:
                     digest_source_tag = self.get_digest_based_source_tag(original_digest)
                     digest_source_manifest = self.get_manifest(registry, repository, digest_source_tag)
                     if digest_source_manifest:
-                        size = self.calculate_manifest_size(digest_source_manifest)
-                        blobs = self.extract_manifest_blobs(digest_source_manifest)
-                        source_containers.append({
-                            'url': f"{registry}/{repository}:{digest_source_tag}",
-                            'size': size,
-                            'blobs': blobs,
-                            'manifest': digest_source_manifest
-                        })
-                        self.log(f"Found digest-based unified source container: {registry}/{repository}:{digest_source_tag} ({size} bytes, {len(blobs)} blobs)")
+                        container_url = f"{registry}/{repository}:{digest_source_tag}"
+                        if self.is_source_container(digest_source_manifest, container_url, digest_source_tag):
+                            size = self.calculate_manifest_size(digest_source_manifest)
+                            blobs = self.extract_manifest_blobs(digest_source_manifest)
+                            source_containers.append({
+                                'url': container_url,
+                                'size': size,
+                                'blobs': blobs,
+                                'manifest': digest_source_manifest
+                            })
+                            self.log(f"Found digest-based unified source container: {container_url} ({size} bytes, {len(blobs)} blobs)")
+                        else:
+                            self.log(f"Skipping {container_url} - not a valid source container")
 
-            # Then check for individual architecture source containers
+            # Check for individual architecture source containers (with validation)
             for entry in original_manifest.get('manifests', []):
                 digest = entry.get('digest')
                 if digest:
-                    # Try method 1: digest as-is (current behavior)
-                    source_tag = self.get_source_container_tag(digest)
-                    source_manifest = self.get_manifest(registry, repository, source_tag)
-                    if source_manifest:
-                        size = self.calculate_manifest_size(source_manifest)
-                        blobs = self.extract_manifest_blobs(source_manifest)
-                        # Use @ for digest-based references
-                        source_url = f"{registry}/{repository}@{source_tag}"
-                        source_containers.append({
-                            'url': source_url,
-                            'size': size,
-                            'blobs': blobs,
-                            'manifest': source_manifest
-                        })
-                        self.log(f"Found arch-specific source container: {source_url} ({size} bytes, {len(blobs)} blobs)")
-                    else:
-                        # Try method 2: digest-based tag format
-                        digest_source_tag = self.get_digest_based_source_tag(digest)
-                        digest_source_manifest = self.get_manifest(registry, repository, digest_source_tag)
-                        if digest_source_manifest:
+                    # Method 1: Use digest-based source tag format (most likely to be valid)
+                    digest_source_tag = self.get_digest_based_source_tag(digest)
+                    digest_source_manifest = self.get_manifest(registry, repository, digest_source_tag)
+                    if digest_source_manifest:
+                        source_url = f"{registry}/{repository}:{digest_source_tag}"
+                        if self.is_source_container(digest_source_manifest, source_url, digest_source_tag):
                             size = self.calculate_manifest_size(digest_source_manifest)
                             blobs = self.extract_manifest_blobs(digest_source_manifest)
-                            source_url = f"{registry}/{repository}:{digest_source_tag}"
                             source_containers.append({
                                 'url': source_url,
                                 'size': size,
                                 'blobs': blobs,
                                 'manifest': digest_source_manifest
                             })
-                            self.log(f"Found digest-based arch-specific source container: {source_url} ({size} bytes, {len(blobs)} blobs)")
+                            self.log(f"Found arch-specific source container: {source_url} ({size} bytes, {len(blobs)} blobs)")
+                        else:
+                            self.log(f"Skipping {source_url} - not a valid source container")
+                    else:
+                        # Method 2: Try digest as-is (legacy behavior, will likely fail validation)
+                        source_tag = self.get_source_container_tag(digest)
+                        source_manifest = self.get_manifest(registry, repository, source_tag)
+                        if source_manifest:
+                            source_url = f"{registry}/{repository}@{source_tag}"
+                            if self.is_source_container(source_manifest, source_url, source_tag):
+                                size = self.calculate_manifest_size(source_manifest)
+                                blobs = self.extract_manifest_blobs(source_manifest)
+                                source_containers.append({
+                                    'url': source_url,
+                                    'size': size,
+                                    'blobs': blobs,
+                                    'manifest': source_manifest
+                                })
+                                self.log(f"Found arch-specific source container (legacy): {source_url} ({size} bytes, {len(blobs)} blobs)")
+                            else:
+                                self.log(f"Skipping {source_url} - not a valid source container")
         else:
             # Try tag-based method first
             source_tag = self.get_source_container_tag(tag)
             source_manifest = self.get_manifest(registry, repository, source_tag)
             if source_manifest:
-                size = self.calculate_manifest_size(source_manifest)
-                blobs = self.extract_manifest_blobs(source_manifest)
-                source_containers.append({
-                    'url': f"{registry}/{repository}:{source_tag}",
-                    'size': size,
-                    'blobs': blobs,
-                    'manifest': source_manifest
-                })
-                self.log(f"Found source container: {registry}/{repository}:{source_tag} ({size} bytes, {len(blobs)} blobs)")
+                container_url = f"{registry}/{repository}:{source_tag}"
+                if self.is_source_container(source_manifest, container_url, source_tag):
+                    size = self.calculate_manifest_size(source_manifest)
+                    blobs = self.extract_manifest_blobs(source_manifest)
+                    source_containers.append({
+                        'url': container_url,
+                        'size': size,
+                        'blobs': blobs,
+                        'manifest': source_manifest
+                    })
+                    self.log(f"Found source container: {container_url} ({size} bytes, {len(blobs)} blobs)")
+                else:
+                    self.log(f"Skipping {container_url} - not a valid source container")
             else:
                 # Try digest-based method as fallback
                 original_digest = self.get_manifest_digest(registry, repository, tag)
@@ -989,15 +1100,19 @@ class SourceContainerMeasurer:
                     digest_source_tag = self.get_digest_based_source_tag(original_digest)
                     digest_source_manifest = self.get_manifest(registry, repository, digest_source_tag)
                     if digest_source_manifest:
-                        size = self.calculate_manifest_size(digest_source_manifest)
-                        blobs = self.extract_manifest_blobs(digest_source_manifest)
-                        source_containers.append({
-                            'url': f"{registry}/{repository}:{digest_source_tag}",
-                            'size': size,
-                            'blobs': blobs,
-                            'manifest': digest_source_manifest
-                        })
-                        self.log(f"Found digest-based source container: {registry}/{repository}:{digest_source_tag} ({size} bytes, {len(blobs)} blobs)")
+                        container_url = f"{registry}/{repository}:{digest_source_tag}"
+                        if self.is_source_container(digest_source_manifest, container_url, digest_source_tag):
+                            size = self.calculate_manifest_size(digest_source_manifest)
+                            blobs = self.extract_manifest_blobs(digest_source_manifest)
+                            source_containers.append({
+                                'url': container_url,
+                                'size': size,
+                                'blobs': blobs,
+                                'manifest': digest_source_manifest
+                            })
+                            self.log(f"Found digest-based source container: {container_url} ({size} bytes, {len(blobs)} blobs)")
+                        else:
+                            self.log(f"Skipping {container_url} - not a valid source container")
 
         return source_containers
 
