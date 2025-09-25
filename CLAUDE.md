@@ -54,7 +54,58 @@ The script uses two algorithms to find source containers:
 - 404 handling for missing source containers
 - Comprehensive logging in verbose mode
 
+## SBOM-Based Base/Builder Image Detection
+
+### Overview
+The script analyzes SPDX SBOMs to identify base and builder images, then performs blob-level deduplication to calculate net source container sizes.
+
+### SBOM Discovery
+- **SBOM Tag Format**: `sha256-<manifest-digest>.sbom`
+- **Supports**: Both single-arch and multi-arch (image-index) containers
+- **Multi-arch Strategy**: For image indexes, analyzes individual architecture SBOMs via `VARIANT_OF` relationships
+
+### Relationship Analysis
+The script looks for specific SPDX relationship types:
+
+1. **DESCENDANT_OF**: Target image is descendant of base image
+   - Example: `yq-container` → `ubi9/ubi` (base image)
+
+2. **BUILD_TOOL_OF**: Builder image used to construct target
+   - Example: `git-clone` → `yq-container` (builder image)
+
+### Target Element Identification
+Multi-strategy approach to find the correct target container in SBOMs:
+
+1. **Primary Strategy**: Find elements that are subjects of `DESCENDANT_OF` relationships
+2. **App Detection**: Prefer elements containing keywords: "yq", "app", "main", "service"
+3. **DESCRIBES Fallback**: Use document `DESCRIBES` relationships
+4. **Package Fallback**: Search packages with OCI/Docker references
+
+### Blob-Level Deduplication
+Instead of simple size subtraction, the script:
+
+1. **Extracts Blob Details**: Gets digest, size, and media type for each blob
+2. **Collects Parent Blobs**: Gathers all blobs from base/builder source containers
+3. **Deduplication Logic**: Only counts child blobs that don't match any parent blob digest
+4. **Net Size Calculation**: Sums sizes of unique blobs only
+
+### purl Parsing
+Extracts container image references from SPDX external references:
+- **Format**: `pkg:oci/name@version?repository_url=registry.io/repo`
+- **Key Feature**: Uses `repository_url` query parameter for actual registry location
+- **Supports**: Both digest-based (`@sha256:...`) and tag-based (`:tag`) references
+
 ## Real-World Examples
+
+### Multi-arch Image (Image Index)
+- **Input**: `quay.io/.../yq:build-image-index`
+- **Process**: Finds unified + per-arch source containers, analyzes image-index SBOM
+- **Result**: 164 unique blobs (1.09GB) after deduplicating 4 shared blobs (319MB)
+
+### Single-arch Image
+- **Input**: `quay.io/.../yq@sha256:333a3e...`
+- **Process**: Finds source container, analyzes arch-specific SBOM
+- **Result**: 2 unique blobs (10.3MB) after deduplicating 1 shared blob (77MB)
 
 ### Red Hat Registry (registry.redhat.io)
 - Uses Bearer token authentication
@@ -64,10 +115,31 @@ The script uses two algorithms to find source containers:
 ### Quay.io
 - Public images work with anonymous access
 - Uses digest-based method when tag-based fails
-- Example: Complex multi-arch image → 1.3GB of source containers
+- Complex multi-arch images with extensive base/builder hierarchies
+
+## Key Method Details
+
+### Blob Processing
+- `extract_manifest_blobs()`: Extracts individual blob information from manifests
+- `deduplicate_child_blobs()`: Compares child vs parent blobs by digest
+- Returns detailed blob analysis with duplicate/unique counts
+
+### SBOM Processing
+- `get_sbom_tag()`: Constructs SBOM tag from manifest digest
+- `parse_spdx_for_base_images()`: Main SBOM analysis entry point
+- `_find_target_element_in_sbom()`: Smart target container identification
+- `_extract_image_from_element()`: Extracts pullable image references from SPDX elements
+
+### Enhanced Error Handling
+- **Target Misidentification**: Robust fallback strategies for target element detection
+- **SBOM Variations**: Handles both image-index and architecture-specific SBOMs
+- **Blob Analysis**: Graceful handling of missing or malformed blob information
+- **Authentication**: Comprehensive registry access with multiple credential sources
 
 ## Development Notes
 - Built for defensive security analysis
 - Follows OCI registry API standards
 - Compatible with Docker, Podman, and Skopeo credential storage
 - Designed for automation and scripting integration
+- **Blob-aware**: Provides accurate deduplication at the layer level
+- **SBOM-native**: Leverages container build provenance for intelligent analysis
