@@ -235,7 +235,7 @@ def main():
         count_mode, unit = 'chars', 'characters'
 
     # Create rate tracker
-    rate_tracker = RateTracker(window_size=10)
+    rate_tracker = RateTracker(window_size=100)
 
     # Calculate initial percentage
     calculate_and_print_percentage(args.file1, args.file2, count_mode, unit, rate_tracker, first_run=True)
