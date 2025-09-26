@@ -784,68 +784,85 @@ class SourceContainerMeasurer:
 
         return blobs
 
-    def is_source_container(self, manifest: Dict, container_url: str, source_tag: str = None) -> bool:
+    def is_source_container(self, manifest: Dict, container_url: str, source_tag: str = None, registry: str = None, repository: str = None) -> bool:
         """
         Validate if a manifest represents a source container vs a runtime container.
-        Source containers typically have many layers and contain source code artifacts.
+        Uses manifest-based detection by examining the container's config and history.
 
         Args:
             manifest: The manifest to validate
             container_url: The URL used to fetch the manifest (may be a digest)
             source_tag: The original source tag used (e.g., 'latest-source' or 'sha256-abc.src')
+            registry: Registry hostname for config blob fetching
+            repository: Repository name for config blob fetching
         """
         if not manifest:
             return False
 
         # Get basic manifest info
-        media_type = manifest.get('mediaType', '')
         layers = manifest.get('layers', [])
         layer_count = len(layers)
         total_size = sum(layer.get('size', 0) for layer in layers)
+        has_reasonable_size = total_size > 1024  # > 1KB (not completely empty)
 
-        # Source container indicators:
-        # 1. URL or source_tag contains '-source' or '.src'
+        # Method 1: URL/tag-based detection (fallback for when registry access fails)
         url_indicators = ['-source', '.src']
         has_source_url = any(indicator in container_url for indicator in url_indicators)
         has_source_tag = source_tag and any(indicator in source_tag for indicator in url_indicators)
-        has_source_indicators = has_source_url or has_source_tag
+        has_naming_indicators = has_source_url or has_source_tag
 
-        # 2. Check for runtime image characteristics (to reject them)
-        # Runtime images typically have few layers (usually 2-5) and modest sizes
-        is_likely_runtime = layer_count <= 5 and total_size < 500 * 1024 * 1024  # < 500MB
+        # Method 2: Manifest-based detection (more reliable)
+        has_bsi_history = False
+        lacks_runtime_labels = False
 
-        # 3. Reasonable size range (not empty, but source containers can be any size)
-        has_reasonable_size = total_size > 1024  # > 1KB (not completely empty)
+        if registry and repository and 'config' in manifest:
+            try:
+                config_digest = manifest['config']['digest']
+                config_url = f"https://{registry}/v2/{repository}/blobs/{config_digest}"
+                config_data = self.make_registry_request(config_url, registry, repository)
 
-        # 4. Check for typical source container layer patterns
-        has_source_patterns = False
-        if layers and layer_count >= 5:
-            # Look for many small-to-medium layers (typical of source builds)
-            small_layers = [l for l in layers if l.get('size', 0) < 50 * 1024 * 1024]  # < 50MB
-            has_source_patterns = len(small_layers) >= max(3, layer_count * 0.4)
+                if config_data:
+                    # Check for BSI (Binary Source Image) tool in history
+                    if 'history' in config_data:
+                        for entry in config_data['history']:
+                            created_by = entry.get('created_by', '')
+                            if 'bsi version' in created_by and 'adding artifact' in created_by:
+                                has_bsi_history = True
+                                break
+
+                    # Check for absence of typical runtime container labels
+                    if 'config' in config_data:
+                        config_config = config_data['config']
+                        if 'Labels' not in config_config or not config_config['Labels']:
+                            lacks_runtime_labels = True
+                        else:
+                            labels = config_config['Labels']
+                            runtime_indicators = ['description', 'maintainer', 'version', 'com.redhat.component', 'io.k8s.description']
+                            has_runtime_labels = any(label in labels for label in runtime_indicators)
+                            lacks_runtime_labels = not has_runtime_labels
+
+            except Exception as e:
+                self.log(f"  - Config analysis failed: {e}")
 
         # Log validation details
         self.log(f"Source container validation for {container_url}:")
         self.log(f"  - URL indicators: {has_source_url} ({url_indicators})")
         if source_tag:
             self.log(f"  - Source tag indicators: {has_source_tag} (tag: {source_tag})")
-        self.log(f"  - Combined indicators: {has_source_indicators}")
+        self.log(f"  - Naming indicators: {has_naming_indicators}")
+        self.log(f"  - BSI history: {has_bsi_history}")
+        self.log(f"  - Lacks runtime labels: {lacks_runtime_labels}")
         self.log(f"  - Layer count: {layer_count}")
         self.log(f"  - Size: {total_size:,} bytes (reasonable: {has_reasonable_size})")
-        self.log(f"  - Runtime-like: {is_likely_runtime}")
-        self.log(f"  - Source patterns: {has_source_patterns}")
 
-        # Consider it a source container if:
-        # 1. Has source indicators (most important) - trust the naming convention
-        # 2. Has reasonable size (not completely empty)
-        # 3. If no source indicators, then apply stricter validation to avoid runtime images
-        if has_source_indicators:
-            # If it has source indicators in the URL or tag, trust it (with basic sanity check)
-            is_source = has_reasonable_size
-        else:
-            # Without source indicators, apply stricter validation
-            is_source = (has_reasonable_size and not is_likely_runtime and
-                        (has_source_patterns or total_size > 100 * 1024 * 1024))
+        # Determine if this is a source container:
+        # 1. Strong evidence: BSI history (definitive source container marker)
+        # 2. Good evidence: Naming indicators + reasonable size
+        # 3. Supporting evidence: Lacks runtime labels + reasonable size
+        manifest_evidence = has_bsi_history or lacks_runtime_labels
+        naming_evidence = has_naming_indicators and has_reasonable_size
+
+        is_source = manifest_evidence or naming_evidence
 
         self.log(f"  - CONCLUSION: {'SOURCE CONTAINER' if is_source else 'NOT A SOURCE CONTAINER'}")
         return is_source
@@ -977,7 +994,7 @@ class SourceContainerMeasurer:
                 common_source_manifest = self.get_manifest(registry, repository, common_tag)
                 if common_source_manifest:
                     container_url = f"{registry}/{repository}:{common_tag}"
-                    if self.is_source_container(common_source_manifest, container_url, common_tag):
+                    if self.is_source_container(common_source_manifest, container_url, common_tag, registry, repository):
                         size = self.calculate_manifest_size(common_source_manifest)
                         blobs = self.extract_manifest_blobs(common_source_manifest)
                         source_containers.append({
@@ -1003,7 +1020,7 @@ class SourceContainerMeasurer:
             unified_source_manifest = self.get_manifest(registry, repository, unified_source_tag)
             if unified_source_manifest:
                 container_url = f"{registry}/{repository}:{unified_source_tag}"
-                if self.is_source_container(unified_source_manifest, container_url, unified_source_tag):
+                if self.is_source_container(unified_source_manifest, container_url, unified_source_tag, registry, repository):
                     size = self.calculate_manifest_size(unified_source_manifest)
                     blobs = self.extract_manifest_blobs(unified_source_manifest)
                     source_containers.append({
@@ -1023,7 +1040,7 @@ class SourceContainerMeasurer:
                     digest_source_manifest = self.get_manifest(registry, repository, digest_source_tag)
                     if digest_source_manifest:
                         container_url = f"{registry}/{repository}:{digest_source_tag}"
-                        if self.is_source_container(digest_source_manifest, container_url, digest_source_tag):
+                        if self.is_source_container(digest_source_manifest, container_url, digest_source_tag, registry, repository):
                             size = self.calculate_manifest_size(digest_source_manifest)
                             blobs = self.extract_manifest_blobs(digest_source_manifest)
                             source_containers.append({
@@ -1045,7 +1062,7 @@ class SourceContainerMeasurer:
                     digest_source_manifest = self.get_manifest(registry, repository, digest_source_tag)
                     if digest_source_manifest:
                         source_url = f"{registry}/{repository}:{digest_source_tag}"
-                        if self.is_source_container(digest_source_manifest, source_url, digest_source_tag):
+                        if self.is_source_container(digest_source_manifest, source_url, digest_source_tag, registry, repository):
                             size = self.calculate_manifest_size(digest_source_manifest)
                             blobs = self.extract_manifest_blobs(digest_source_manifest)
                             source_containers.append({
@@ -1063,7 +1080,7 @@ class SourceContainerMeasurer:
                         source_manifest = self.get_manifest(registry, repository, source_tag)
                         if source_manifest:
                             source_url = f"{registry}/{repository}@{source_tag}"
-                            if self.is_source_container(source_manifest, source_url, source_tag):
+                            if self.is_source_container(source_manifest, source_url, source_tag, registry, repository):
                                 size = self.calculate_manifest_size(source_manifest)
                                 blobs = self.extract_manifest_blobs(source_manifest)
                                 source_containers.append({
@@ -1081,7 +1098,7 @@ class SourceContainerMeasurer:
             source_manifest = self.get_manifest(registry, repository, source_tag)
             if source_manifest:
                 container_url = f"{registry}/{repository}:{source_tag}"
-                if self.is_source_container(source_manifest, container_url, source_tag):
+                if self.is_source_container(source_manifest, container_url, source_tag, registry, repository):
                     size = self.calculate_manifest_size(source_manifest)
                     blobs = self.extract_manifest_blobs(source_manifest)
                     source_containers.append({
@@ -1101,7 +1118,7 @@ class SourceContainerMeasurer:
                     digest_source_manifest = self.get_manifest(registry, repository, digest_source_tag)
                     if digest_source_manifest:
                         container_url = f"{registry}/{repository}:{digest_source_tag}"
-                        if self.is_source_container(digest_source_manifest, container_url, digest_source_tag):
+                        if self.is_source_container(digest_source_manifest, container_url, digest_source_tag, registry, repository):
                             size = self.calculate_manifest_size(digest_source_manifest)
                             blobs = self.extract_manifest_blobs(digest_source_manifest)
                             source_containers.append({
