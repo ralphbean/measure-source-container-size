@@ -1214,16 +1214,31 @@ def main():
     parser = argparse.ArgumentParser(
         description='Measure the size of source containers associated with OCI artifacts'
     )
-    parser.add_argument('url', help='OCI artifact URL (e.g., registry.redhat.io/ubi8:latest)')
+    parser.add_argument('url', nargs='?', help='OCI artifact URL (e.g., registry.redhat.io/ubi8:latest). If not provided, reads from stdin.')
     parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose output')
     parser.add_argument('-j', '--json', action='store_true', help='Output results as JSON')
+    parser.add_argument('--append', metavar='FILE', help='Append the size in bytes to the specified file instead of printing to stdout')
+    parser.add_argument('--format', choices=['number', 'csv'], default='number', help='Output format: "number" (default, size only) or "csv" (image,size)')
 
     args = parser.parse_args()
+
+    # Get URL from argument or stdin
+    if args.url:
+        url = args.url
+    else:
+        try:
+            url = input().strip()
+            if not url:
+                print("Error: No URL provided", file=sys.stderr)
+                sys.exit(1)
+        except (EOFError, KeyboardInterrupt):
+            print("Error: No URL provided", file=sys.stderr)
+            sys.exit(1)
 
     measurer = SourceContainerMeasurer(verbose=args.verbose)
 
     try:
-        result = measurer.measure_source_size(args.url)
+        result = measurer.measure_source_size(url)
 
         if args.json:
             print(json.dumps(result, indent=2), file=sys.stderr)
@@ -1260,7 +1275,16 @@ def main():
                 print("No source containers found.", file=sys.stderr)
 
         # Output the net source size (after base/builder image subtraction) for scripting
-        print(result['net_source_size'])
+        if args.format == 'csv':
+            output_line = f"{url},{result['net_source_size']}"
+        else:  # args.format == 'number'
+            output_line = str(result['net_source_size'])
+
+        if args.append:
+            with open(args.append, 'a') as f:
+                f.write(f"{output_line}\n")
+        else:
+            print(output_line)
 
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)

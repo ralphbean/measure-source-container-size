@@ -35,6 +35,10 @@ The script uses two algorithms to find source containers:
 ### Output Format
 - **stdout**: Total size in bytes (for scripting)
 - **stderr**: All other information (verbose logs, container details)
+- **Output Options**:
+  - `--format number` (default): Outputs just the net source size in bytes
+  - `--format csv`: Outputs `image_url,size_in_bytes` format
+  - `--append FILE`: Appends output to specified file instead of stdout
 - Proper OCI URL syntax:
   - Tags: `registry/repo:tag`
   - Digests: `registry/repo@sha256:digest`
@@ -94,6 +98,45 @@ Extracts container image references from SPDX external references:
 - **Format**: `pkg:oci/name@version?repository_url=registry.io/repo`
 - **Key Feature**: Uses `repository_url` query parameter for actual registry location
 - **Supports**: Both digest-based (`@sha256:...`) and tag-based (`:tag`) references
+
+## Usage Examples
+
+### Command Line Options
+```bash
+# Basic usage - outputs size in bytes to stdout
+./measure-source-size.py registry.redhat.io/ubi8:latest
+
+# Read image URL from stdin
+echo "registry.redhat.io/ubi8:latest" | ./measure-source-size.py
+
+# CSV format - outputs image,size
+./measure-source-size.py --format csv registry.redhat.io/ubi8:latest
+
+# Append to file instead of stdout
+./measure-source-size.py --append measurements.csv registry.redhat.io/ubi8:latest
+
+# CSV format appended to file
+./measure-source-size.py --format csv --append results.csv registry.redhat.io/ubi8:latest
+
+# Verbose output with JSON details
+./measure-source-size.py -v -j registry.redhat.io/ubi8:latest
+```
+
+### Batch Processing
+```bash
+# Measure multiple images and append to CSV file
+for image in image1:latest image2:v1.0 image3:stable; do
+    ./measure-source-size.py --format csv --append batch_results.csv "$image"
+done
+
+# Using stdin for batch processing from a file
+cat image_list.txt | while read image; do
+    echo "$image" | ./measure-source-size.py --format csv --append batch_results.csv
+done
+
+# Pipeline processing
+cat image_list.txt | xargs -I {} ./measure-source-size.py --format csv --append results.csv {}
+```
 
 ## Real-World Examples
 
