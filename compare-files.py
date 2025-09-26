@@ -18,7 +18,8 @@ def count_file_stats(filename):
         with open(filename, 'r', encoding='utf-8', errors='replace') as f:
             content_text = f.read()
 
-        lines = content_text.count('\n')
+        # Count lines the same way wc -l does: count newlines in binary mode
+        lines = content_bytes.count(b'\n')
         words = len(content_text.split())
         chars = len(content_text)
         bytes_count = len(content_bytes)
