@@ -10,21 +10,62 @@ import json
 import os
 import re
 import sys
-import urllib.request
 import urllib.parse
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-from urllib.error import HTTPError, URLError
+
+try:
+    import requests
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
+    HAS_REQUESTS = True
+except ImportError:
+    import urllib.request
+    from urllib.error import HTTPError, URLError
+    HAS_REQUESTS = False
 
 
 class SourceContainerMeasurer:
     def __init__(self, verbose: bool = False):
         self.verbose = verbose
         self.auth_config = self._load_docker_config()
+        self.session = self._create_session() if HAS_REQUESTS else None
 
     def log(self, message: str):
         if self.verbose:
             print(f"[INFO] {message}", file=sys.stderr)
+
+    def _create_session(self):
+        """Create a requests session with connection pooling and retry strategy."""
+        if not HAS_REQUESTS:
+            return None
+
+        session = requests.Session()
+
+        # Configure retry strategy
+        retry_strategy = Retry(
+            total=3,
+            status_forcelist=[429, 500, 502, 503, 504],
+            backoff_factor=1
+        )
+
+        # Configure HTTP adapter with connection pooling
+        adapter = HTTPAdapter(
+            pool_connections=10,  # Number of connection pools
+            pool_maxsize=20,      # Max connections per pool
+            max_retries=retry_strategy
+        )
+
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+
+        # Set default headers
+        session.headers.update({
+            'User-Agent': 'measure-source-size/1.0'
+        })
+
+        self.log("Created HTTP session with connection pooling")
+        return session
 
     def _load_docker_config(self) -> Dict:
         """Load Docker authentication configuration from standard locations."""
@@ -110,17 +151,29 @@ class SourceContainerMeasurer:
         """Get Bearer token for registry access."""
         # First try to get a manifest to trigger WWW-Authenticate
         test_url = f"https://{registry}/v2/{repository}/manifests/latest"
-        req = urllib.request.Request(test_url)
 
         try:
-            with urllib.request.urlopen(req) as response:
-                # If we get here without auth, the registry allows anonymous access
-                return None
-        except HTTPError as e:
-            if e.code != 401:
-                return None
+            if self.session:
+                response = self.session.get(test_url, timeout=30)
+                if response.status_code == 200:
+                    # If we get here without auth, the registry allows anonymous access
+                    return None
+                elif response.status_code != 401:
+                    return None
 
-            www_auth = e.headers.get('WWW-Authenticate')
+                www_auth = response.headers.get('WWW-Authenticate')
+            else:
+                # Fallback to urllib.request
+                req = urllib.request.Request(test_url)
+                try:
+                    with urllib.request.urlopen(req) as response:
+                        # If we get here without auth, the registry allows anonymous access
+                        return None
+                except HTTPError as e:
+                    if e.code != 401:
+                        return None
+                    www_auth = e.headers.get('WWW-Authenticate')
+
             if not www_auth:
                 return None
 
@@ -149,22 +202,39 @@ class SourceContainerMeasurer:
             self.log(f"Requesting token from: {token_url}")
 
             # Make token request
-            token_req = urllib.request.Request(token_url)
+            headers = {}
             if credentials:
                 username, password = credentials
                 credentials_str = f"{username}:{password}"
                 encoded = base64.b64encode(credentials_str.encode()).decode()
-                token_req.add_header('Authorization', f'Basic {encoded}')
+                headers['Authorization'] = f'Basic {encoded}'
 
             try:
-                with urllib.request.urlopen(token_req) as token_response:
-                    token_data = json.loads(token_response.read().decode('utf-8'))
-                    token = token_data.get('token') or token_data.get('access_token')
-                    if token:
-                        self.log(f"Successfully obtained Bearer token for {registry}")
-                        return token
+                if self.session:
+                    token_response = self.session.get(token_url, headers=headers, timeout=30)
+                    if token_response.status_code == 200:
+                        token_data = token_response.json()
+                        token = token_data.get('token') or token_data.get('access_token')
+                        if token:
+                            self.log(f"Successfully obtained Bearer token for {registry}")
+                            return token
+                else:
+                    # Fallback to urllib.request
+                    token_req = urllib.request.Request(token_url)
+                    for header_name, header_value in headers.items():
+                        token_req.add_header(header_name, header_value)
+
+                    with urllib.request.urlopen(token_req) as token_response:
+                        token_data = json.loads(token_response.read().decode('utf-8'))
+                        token = token_data.get('token') or token_data.get('access_token')
+                        if token:
+                            self.log(f"Successfully obtained Bearer token for {registry}")
+                            return token
             except Exception as e:
                 self.log(f"Failed to get Bearer token: {e}")
+
+        except Exception as e:
+            self.log(f"Error during token request: {e}")
 
         return None
 
@@ -223,44 +293,84 @@ class SourceContainerMeasurer:
             headers['Authorization'] = f"Bearer {bearer_token}"
             self.log(f"Using Bearer token authentication for {registry}")
 
-        req = urllib.request.Request(url, headers=headers)
-
         try:
-            with urllib.request.urlopen(req) as response:
-                response_text = response.read().decode('utf-8')
-                if not response_text.strip():
-                    self.log(f"Empty response from {url}")
+            if self.session:
+                response = self.session.get(url, headers=headers, timeout=30)
+
+                if response.status_code == 404:
                     return None
-                return json.loads(response_text)
-        except json.JSONDecodeError as e:
-            self.log(f"JSON decode error for {url}: {e}")
-            return None
-        except HTTPError as e:
-            if e.code == 404:
-                return None
-            elif e.code == 401:
-                self.log(f"Authentication failed for {registry}")
-                # Try without authentication if auth failed
-                if 'Authorization' in headers:
-                    self.log(f"Retrying without authentication for {registry}")
-                    del headers['Authorization']
-                    req = urllib.request.Request(url, headers=headers)
-                    try:
-                        with urllib.request.urlopen(req) as response:
-                            response_text = response.read().decode('utf-8')
-                            if not response_text.strip():
+                elif response.status_code == 401:
+                    self.log(f"Authentication failed for {registry}")
+                    # Try without authentication if auth failed
+                    if 'Authorization' in headers:
+                        self.log(f"Retrying without authentication for {registry}")
+                        retry_headers = headers.copy()
+                        del retry_headers['Authorization']
+                        retry_response = self.session.get(url, headers=retry_headers, timeout=30)
+                        if retry_response.status_code == 404:
+                            return None
+                        elif retry_response.status_code == 401:
+                            self.log(f"Anonymous access also failed for {registry}")
+                            return None
+                        retry_response.raise_for_status()
+                        try:
+                            return retry_response.json()
+                        except ValueError:
+                            response_text = retry_response.text.strip()
+                            if not response_text:
                                 self.log(f"Empty response from {url} (retry)")
                                 return None
                             return json.loads(response_text)
-                    except json.JSONDecodeError as retry_e:
-                        self.log(f"JSON decode error for {url} (retry): {retry_e}")
+                    return None
+
+                response.raise_for_status()
+                try:
+                    return response.json()
+                except ValueError:
+                    response_text = response.text.strip()
+                    if not response_text:
+                        self.log(f"Empty response from {url}")
                         return None
-                    except HTTPError as retry_e:
-                        if retry_e.code == 404:
+                    return json.loads(response_text)
+            else:
+                # Fallback to urllib.request
+                req = urllib.request.Request(url, headers=headers)
+                try:
+                    with urllib.request.urlopen(req) as response:
+                        response_text = response.read().decode('utf-8')
+                        if not response_text.strip():
+                            self.log(f"Empty response from {url}")
                             return None
-                        self.log(f"Anonymous access also failed for {registry}")
-                return None
-            raise
+                        return json.loads(response_text)
+                except HTTPError as e:
+                    if e.code == 404:
+                        return None
+                    elif e.code == 401:
+                        self.log(f"Authentication failed for {registry}")
+                        # Try without authentication if auth failed
+                        if 'Authorization' in headers:
+                            self.log(f"Retrying without authentication for {registry}")
+                            del headers['Authorization']
+                            req = urllib.request.Request(url, headers=headers)
+                            try:
+                                with urllib.request.urlopen(req) as response:
+                                    response_text = response.read().decode('utf-8')
+                                    if not response_text.strip():
+                                        self.log(f"Empty response from {url} (retry)")
+                                        return None
+                                    return json.loads(response_text)
+                            except HTTPError as retry_e:
+                                if retry_e.code == 404:
+                                    return None
+                                self.log(f"Anonymous access also failed for {registry}")
+                        return None
+                    raise
+        except json.JSONDecodeError as e:
+            self.log(f"JSON decode error for {url}: {e}")
+            return None
+        except Exception as e:
+            self.log(f"Request error for {url}: {e}")
+            return None
 
     def get_manifest(self, registry: str, repository: str, tag: str) -> Optional[Dict]:
         """Get manifest for a specific tag."""
@@ -282,36 +392,69 @@ class SourceContainerMeasurer:
         if bearer_token:
             headers['Authorization'] = f"Bearer {bearer_token}"
 
-        req = urllib.request.Request(url, headers=headers)
-        req.get_method = lambda: 'HEAD'
-
         try:
-            with urllib.request.urlopen(req) as response:
+            if self.session:
+                response = self.session.head(url, headers=headers, timeout=30)
+
+                if response.status_code == 404:
+                    return None
+                elif response.status_code == 401:
+                    # Try without authentication if auth failed
+                    if 'Authorization' in headers:
+                        self.log(f"Retrying digest request without authentication for {registry}")
+                        retry_headers = headers.copy()
+                        del retry_headers['Authorization']
+                        retry_response = self.session.head(url, headers=retry_headers, timeout=30)
+                        if retry_response.status_code == 404:
+                            return None
+                        elif retry_response.status_code == 401:
+                            return None
+                        retry_response.raise_for_status()
+                        digest = retry_response.headers.get('Docker-Content-Digest')
+                        if digest:
+                            self.log(f"Got manifest digest: {digest}")
+                            return digest
+                    return None
+
+                response.raise_for_status()
                 digest = response.headers.get('Docker-Content-Digest')
                 if digest:
                     self.log(f"Got manifest digest: {digest}")
                     return digest
-        except HTTPError as e:
-            if e.code == 404:
-                return None
-            elif e.code == 401:
-                # Try without authentication if auth failed
-                if 'Authorization' in headers:
-                    self.log(f"Retrying digest request without authentication for {registry}")
-                    del headers['Authorization']
-                    req = urllib.request.Request(url, headers=headers)
-                    req.get_method = lambda: 'HEAD'
-                    try:
-                        with urllib.request.urlopen(req) as response:
-                            digest = response.headers.get('Docker-Content-Digest')
-                            if digest:
-                                self.log(f"Got manifest digest: {digest}")
-                                return digest
-                    except HTTPError as retry_e:
-                        if retry_e.code == 404:
-                            return None
-                return None
-            raise
+            else:
+                # Fallback to urllib.request
+                req = urllib.request.Request(url, headers=headers)
+                req.get_method = lambda: 'HEAD'
+
+                try:
+                    with urllib.request.urlopen(req) as response:
+                        digest = response.headers.get('Docker-Content-Digest')
+                        if digest:
+                            self.log(f"Got manifest digest: {digest}")
+                            return digest
+                except HTTPError as e:
+                    if e.code == 404:
+                        return None
+                    elif e.code == 401:
+                        # Try without authentication if auth failed
+                        if 'Authorization' in headers:
+                            self.log(f"Retrying digest request without authentication for {registry}")
+                            del headers['Authorization']
+                            req = urllib.request.Request(url, headers=headers)
+                            req.get_method = lambda: 'HEAD'
+                            try:
+                                with urllib.request.urlopen(req) as response:
+                                    digest = response.headers.get('Docker-Content-Digest')
+                                    if digest:
+                                        self.log(f"Got manifest digest: {digest}")
+                                        return digest
+                            except HTTPError as retry_e:
+                                if retry_e.code == 404:
+                                    return None
+                        return None
+                    raise
+        except Exception as e:
+            self.log(f"Error getting manifest digest for {url}: {e}")
 
         return None
 
@@ -331,11 +474,15 @@ class SourceContainerMeasurer:
                 # Look for SBOM in layers or config
                 for layer in sbom_data.get('layers', []):
                     if 'spdx' in layer.get('mediaType', '').lower() or 'sbom' in layer.get('mediaType', '').lower():
-                        # Fetch the blob
-                        blob_url = f"https://{registry}/v2/{repository}/blobs/{layer['digest']}"
-                        blob_data = self.make_registry_request(blob_url, registry, repository)
-                        if blob_data:
-                            return blob_data
+                        try:
+                            # Fetch the blob
+                            blob_url = f"https://{registry}/v2/{repository}/blobs/{layer['digest']}"
+                            blob_data = self.make_registry_request(blob_url, registry, repository)
+                            if blob_data:
+                                return blob_data
+                        except Exception as e:
+                            self.log(f"Error fetching SBOM blob from {blob_url}: {e}")
+                            continue
 
             # Try to parse as direct SBOM data
             return sbom_data
@@ -1227,7 +1374,7 @@ def main():
         url = args.url
     else:
         try:
-            url = input().strip()
+            url = sys.stdin.readline().strip()
             if not url:
                 print("Error: No URL provided", file=sys.stderr)
                 sys.exit(1)
@@ -1281,8 +1428,12 @@ def main():
             output_line = str(result['net_source_size'])
 
         if args.append:
-            with open(args.append, 'a') as f:
-                f.write(f"{output_line}\n")
+            try:
+                with open(args.append, 'a') as f:
+                    f.write(f"{output_line}\n")
+            except IOError as e:
+                print(f"Error writing to file {args.append}: {e}", file=sys.stderr)
+                sys.exit(1)
         else:
             print(output_line)
 
