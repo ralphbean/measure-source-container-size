@@ -1380,6 +1380,24 @@ def format_size(size_bytes: int) -> str:
     return f"{size_bytes:.2f} PB"
 
 
+def check_image_already_measured(url: str, append_file: str) -> bool:
+    """Check if image URL already exists in the append file."""
+    try:
+        with open(append_file, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line and ',' in line:
+                    existing_url = line.split(',', 1)[0]
+                    if existing_url == url:
+                        return True
+    except FileNotFoundError:
+        # File doesn't exist yet, so image hasn't been measured
+        return False
+    except IOError:
+        # Can't read file, continue with measurement
+        return False
+    return False
+
 def main():
     parser = argparse.ArgumentParser(
         description='Measure the size of source containers associated with OCI artifacts'
@@ -1404,6 +1422,13 @@ def main():
         except (EOFError, KeyboardInterrupt):
             print("Error: No URL provided", file=sys.stderr)
             sys.exit(1)
+
+    # Check for idempotency: if using --append with --format csv,
+    # exit early if image already measured
+    if args.append and args.format == 'csv':
+        if check_image_already_measured(url, args.append):
+            # Image already measured, exit silently with success
+            sys.exit(0)
 
     measurer = SourceContainerMeasurer(verbose=args.verbose)
 
