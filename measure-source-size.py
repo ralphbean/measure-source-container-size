@@ -60,9 +60,14 @@ class SourceContainerMeasurer:
         session.mount("https://", adapter)
 
         # Set default headers
-        session.headers.update({
-            'User-Agent': 'measure-source-size/1.0'
-        })
+        headers = {'User-Agent': 'measure-source-size/1.0'}
+
+        # Add username header if available
+        username = os.environ.get('USERNAME')
+        if username:
+            headers['X-Requested-By'] = username
+
+        session.headers.update(headers)
 
         self.log("Created HTTP session with connection pooling")
         return session
@@ -209,6 +214,12 @@ class SourceContainerMeasurer:
                 encoded = base64.b64encode(credentials_str.encode()).decode()
                 headers['Authorization'] = f'Basic {encoded}'
 
+            # Add username header if not using session (urllib.request fallback)
+            if not self.session:
+                env_username = os.environ.get('USERNAME')
+                if env_username:
+                    headers['X-Requested-By'] = env_username
+
             try:
                 if self.session:
                     token_response = self.session.get(token_url, headers=headers, timeout=30)
@@ -286,6 +297,12 @@ class SourceContainerMeasurer:
             headers = {}
 
         headers.setdefault('Accept', 'application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.index.v1+json')
+
+        # Add username header if not using session (urllib.request fallback)
+        if not self.session:
+            username = os.environ.get('USERNAME')
+            if username:
+                headers.setdefault('X-Requested-By', username)
 
         # Try Bearer token authentication
         bearer_token = self._get_bearer_token(registry, repository)
@@ -386,6 +403,12 @@ class SourceContainerMeasurer:
         headers = {
             'Accept': 'application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.index.v1+json'
         }
+
+        # Add username header if not using session (urllib.request fallback)
+        if not self.session:
+            username = os.environ.get('USERNAME')
+            if username:
+                headers['X-Requested-By'] = username
 
         # Try Bearer token authentication
         bearer_token = self._get_bearer_token(registry, repository)
